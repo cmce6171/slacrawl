@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## 0.10.3 - 2026-10-16
+
+**Highlights:** Include the October Go standard-library security fixes and refresh CrawlKit and SQLite for safer archive handling.
+
+- Build with Go 1.27.2 to include the October standard-library security fixes; retain the Go 1.27.0 source minimum and macOS compatibility checks.
+- Update CrawlKit to 0.17.0 and SQLite to 1.60.1 with its matching libc 1.77.1 runtime for safer WAL error handling and faster large statement binding; refresh ANSI rendering, networking, timestamp formatting, and analysis tools while retaining the Go 1.27.0 minimum.
+- Update CrawlKit to 0.16.7 and the pinned Release Drafter actions to 7.9.0, retaining the Go 1.27.0 minimum. Thanks @vincentkoc and @dependabot! (#261, #264, #265, #266)
+- Expose a non-publishing dry run of the unified release workflow for build, signing, and package verification.
+
+## 0.10.2 - 2026-10-02
+
+**Highlights:** Update CrawlKit to 0.16.6 and refresh CodeQL and TruffleHog security scanning.
+
+- Update CrawlKit to 0.16.6.
+
+- Update the pinned CodeQL action to 4.38.2. Thanks @dependabot.
+
+- Update TruffleHog secret scanning to 3.97.9. Thanks @dependabot.
+
 ## 0.10.1 - 2026-09-24
 
 **Highlights:** Restore desktop sync when cached messages contain timestamped attachments, retaining quoted content in the parent payload.
