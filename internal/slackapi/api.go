@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -46,16 +47,18 @@ type Diagnostics struct {
 }
 
 type SyncOptions struct {
-	WorkspaceID      string
-	Channels         []string
-	ExcludeChannels  []string
-	Since            string
-	Full             bool
-	LatestOnly       bool
-	Concurrency      int
-	AutoJoin         *bool
-	enforceRetention bool
-	ordinarySync     bool
+	WorkspaceID       string
+	Channels          []string
+	ExcludeChannels   []string
+	Since             string
+	Full              bool
+	SelectedDiscovery bool
+	ChangedThreads    bool
+	LatestOnly        bool
+	Concurrency       int
+	AutoJoin          *bool
+	enforceRetention  bool
+	ordinarySync      bool
 }
 
 type Client struct {
@@ -172,8 +175,14 @@ func (c *Client) Doctor(ctx context.Context) (Diagnostics, error) {
 }
 
 func (c *Client) Sync(ctx context.Context, st *store.Store, opts SyncOptions) error {
+	if opts.SelectedDiscovery && len(opts.Channels) == 0 {
+		return errors.New("selected discovery requires explicit channel IDs")
+	}
 	// Empty Since alone also describes Tail repair; only ordinary Sync owns
 	// the durable retained-thread backlog.
+	if opts.ChangedThreads && (!opts.Full || opts.Since != "" || opts.LatestOnly) {
+		return errors.New("changed-threads requires full API history without since or latest-only")
+	}
 	opts.ordinarySync = true
 	// Selection is invocation-local: Tail and its repair path still own the bot.
 	source := channelSyncSource{
@@ -187,6 +196,9 @@ func (c *Client) Sync(ctx context.Context, st *store.Store, opts SyncOptions) er
 	}
 	if source.token == "" {
 		return errors.New("SLACK_BOT_TOKEN or SLACK_USER_TOKEN is required for api sync")
+	}
+	if opts.SelectedDiscovery && source.sourceName != SourceUser {
+		return errors.New("selected discovery requires the user-token primary source")
 	}
 
 	auth, err := c.authTest(ctx, source.token)
@@ -209,6 +221,7 @@ func (c *Client) Sync(ctx context.Context, st *store.Store, opts SyncOptions) er
 	if err := st.UpsertWorkspace(ctx, store.Workspace{
 		ID:           workspaceID,
 		Name:         auth.Team,
+		Domain:       workspaceDomain(auth.URL),
 		EnterpriseID: auth.EnterpriseID,
 		RawJSON:      store.MarshalRaw(auth),
 		UpdatedAt:    now,
@@ -218,7 +231,12 @@ func (c *Client) Sync(ctx context.Context, st *store.Store, opts SyncOptions) er
 	threadRepliesSkipped := newThreadSkipTracker()
 	source.threadSkip = threadRepliesSkipped
 
-	channels, err := c.fetchChannelsWithToken(ctx, source.token, workspaceID)
+	var channels, scopedDMs []slack.Channel
+	if opts.SelectedDiscovery {
+		channels, scopedDMs, err = c.fetchSelectedConversations(ctx, source.token, opts.Channels, opts.ExcludeChannels)
+	} else {
+		channels, err = c.fetchChannelsWithToken(ctx, source.token, workspaceID)
+	}
 	if err != nil {
 		return err
 	}
@@ -258,7 +276,10 @@ func (c *Client) Sync(ctx context.Context, st *store.Store, opts SyncOptions) er
 			userByID[user.ID] = user
 		}
 
-		dms, err := c.fetchDMs(ctx, workspaceID, threadRepliesSkipped)
+		dms := scopedDMs
+		if !opts.SelectedDiscovery {
+			dms, err = c.fetchDMs(ctx, workspaceID, threadRepliesSkipped)
+		}
 		if err != nil {
 			if isMissingScopeError(err) {
 				threadRepliesSkipped.RecordOmission()
@@ -320,6 +341,39 @@ func (c *Client) Sync(ctx context.Context, st *store.Store, opts SyncOptions) er
 		return err
 	}
 	return st.SetSyncState(ctx, source.sourceName, "workspace", workspaceID, now.Format(time.RFC3339))
+}
+
+// fetchSelectedConversations resolves only opted-in IDs. A failed or mismatched
+// response fails the scan; it never broadens a scoped run to a workspace catalog.
+func (c *Client) fetchSelectedConversations(ctx context.Context, token string, ids, exclusions []string) ([]slack.Channel, []slack.Channel, error) {
+	var channels, dms []slack.Channel
+	seen := map[string]bool{}
+	excluded := excludedChannelNames(exclusions)
+	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		if _, denied := excluded[strings.ToLower(strings.TrimSpace(id))]; denied {
+			continue
+		}
+		channel, err := c.getConversationInfoWithToken(ctx, token, id)
+		if err != nil {
+			return nil, nil, err
+		}
+		if channel == nil || channel.ID != id {
+			return nil, nil, errors.New("selected conversation metadata identity mismatch")
+		}
+		if channelExcluded(*channel, excluded) {
+			continue
+		}
+		if channel.IsIM || channel.IsMpIM {
+			dms = append(dms, *channel)
+		} else {
+			channels = append(channels, *channel)
+		}
+	}
+	return channels, dms, nil
 }
 
 func (c *Client) fetchChannels(ctx context.Context, workspaceID string) ([]slack.Channel, error) {
@@ -400,4 +454,18 @@ func sleepContext(ctx context.Context, delay time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+// workspaceDomain returns the subdomain of an auth.test workspace URL, such as
+// "acme" for https://acme.slack.com/, or "" when the URL is not a Slack host.
+func workspaceDomain(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	domain, ok := strings.CutSuffix(parsed.Hostname(), ".slack.com")
+	if !ok {
+		return ""
+	}
+	return domain
 }

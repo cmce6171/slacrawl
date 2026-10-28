@@ -1273,6 +1273,28 @@ enabled = true
 path = ""
 ```
 
+### Scheduled changed-thread scans
+
+`slacrawl sync --source api --full --changed-threads --auto-join=false`
+scans the complete selected parent history, including messages that previously
+had no replies. It reuses a successful thread fetch for up to 24 hours only
+when fresh parent reply count and latest-reply timestamp match, the archived
+reply rows still match, and no pending job or skip existed before the scan.
+New first replies on old messages therefore trigger a fetch. A complete reply
+traversal must match the current root count and latest reply; missing live
+replies leave native history incomplete. Extra historical archive rows disable
+caching without making a complete current traversal fail. Deleted tombstones
+are excluded from active archive counts. Missing metadata,
+partial/failed fetches, pending work, and changed threads are fetched normally.
+The command rejects `--since`, `--latest-only`, or non-API sources.
+
+This optimizes thread downloads, not parent-history traversal. Cached thread
+contents may lag edits until the 24-hour reconciliation; deletion handling is
+unchanged from ordinary API sync. Use ordinary `--full` when a fresh read of
+every retained reply is required. A completed native history scan remains the
+coverage boundary; a scheduling wrapper must publish its receipt only after
+the command succeeds and verify the selected channel scopes.
+
 ### API sync without live tail
 
 ```toml

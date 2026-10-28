@@ -32,6 +32,8 @@ func (a *App) runSync(ctx context.Context, configPath string, args []string, for
 	excludeChannels := fs.String("exclude-channels", "", "comma separated channel names to skip during sync")
 	since := fs.String("since", "", "oldest slack ts or RFC3339 timestamp")
 	full := fs.Bool("full", false, "full sync")
+	selectedDiscovery := fs.Bool("selected-discovery", false, "resolve only explicitly selected conversation metadata")
+	changedThreads := fs.Bool("changed-threads", false, "with full API history, fetch only changed threads; reconcile all replies every 24 hours")
 	latestOnly := fs.Bool("latest-only", false, "skip first-time historical backfills")
 	limit := fs.Int("limit", 0, "maximum provider messages (validation imports only)")
 	concurrency := fs.Int("concurrency", cfg.Sync.Concurrency, "worker count")
@@ -57,6 +59,9 @@ func (a *App) runSync(ctx context.Context, configPath string, args []string, for
 	if err != nil {
 		return err
 	}
+	if *changedThreads && (resolvedSource != syncer.SourceAPI || !*full || *since != "" || *latestOnly) {
+		return errors.New("changed-threads requires source api and full, without since or latest-only")
+	}
 	runOptions := syncer.Options{
 		Source:       resolvedSource,
 		WorkspaceID:  resolvedWorkspaceID,
@@ -66,15 +71,17 @@ func (a *App) runSync(ctx context.Context, configPath string, args []string, for
 			cfg.Sync.ExcludeChannels,
 			csv(*excludeChannels),
 		),
-		Since:       normalizedSince,
-		Full:        *full,
-		LatestOnly:  *latestOnly,
-		Limit:       *limit,
-		Concurrency: *concurrency,
-		AutoJoin:    boolPtr(*autoJoin),
-		APIURL:      a.apiURL,
-		HTTPClient:  a.httpClient,
-		Logger:      progressLogger(a.Stderr),
+		Since:             normalizedSince,
+		Full:              *full,
+		ChangedThreads:    *changedThreads,
+		SelectedDiscovery: *selectedDiscovery,
+		LatestOnly:        *latestOnly,
+		Limit:             *limit,
+		Concurrency:       *concurrency,
+		AutoJoin:          boolPtr(*autoJoin),
+		APIURL:            a.apiURL,
+		HTTPClient:        a.httpClient,
+		Logger:            progressLogger(a.Stderr),
 	}
 	st, err := a.openStore(cfg)
 	if err != nil {

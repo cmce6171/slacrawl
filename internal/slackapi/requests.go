@@ -34,6 +34,10 @@ func (c *Client) authTest(ctx context.Context, token string) (*slack.AuthTestRes
 }
 
 func (c *Client) getConversationInfo(ctx context.Context, channelID string) (*slack.Channel, error) {
+	return c.getConversationInfoWithToken(ctx, c.tokens.Bot, channelID)
+}
+
+func (c *Client) getConversationInfoWithToken(ctx context.Context, token, channelID string) (*slack.Channel, error) {
 	if channelID == "" {
 		return nil, errors.New("ChannelID must be defined")
 	}
@@ -49,7 +53,7 @@ func (c *Client) getConversationInfo(ctx context.Context, channelID string) (*sl
 			slack.SlackResponse
 			Metadata slack.ResponseMetadata `json:"response_metadata"`
 		}
-		if _, err := c.postSlackForm(ctx, c.tokens.Bot, "conversations.info", values, &response); err != nil {
+		if _, err := c.postSlackForm(ctx, token, "conversations.info", values, &response); err != nil {
 			return nil, err
 		}
 		if err := nativeResponseSuccess("conversations.info", response.SlackResponse); err != nil {

@@ -1721,7 +1721,7 @@ insert into workspaces (id, name, domain, enterprise_id, raw_json, updated_at)
 values (?, ?, ?, ?, ?, ?)
 on conflict(id) do update set
   name=excluded.name,
-  domain=excluded.domain,
+  domain=coalesce(nullif(excluded.domain, ''), workspaces.domain),
   enterprise_id=excluded.enterprise_id,
   raw_json=excluded.raw_json,
   updated_at=excluded.updated_at

@@ -50,20 +50,22 @@ func ProviderName(source Source) (string, bool) {
 }
 
 type Options struct {
-	Source          Source
-	WorkspaceID     string
-	WorkspaceSet    bool
-	Channels        []string
-	ExcludeChannels []string
-	Since           string
-	Full            bool
-	LatestOnly      bool
-	Limit           int
-	Concurrency     int
-	AutoJoin        *bool
-	APIURL          string
-	HTTPClient      *http.Client
-	Logger          *slog.Logger
+	Source            Source
+	WorkspaceID       string
+	WorkspaceSet      bool
+	Channels          []string
+	ExcludeChannels   []string
+	Since             string
+	Full              bool
+	SelectedDiscovery bool
+	ChangedThreads    bool
+	LatestOnly        bool
+	Limit             int
+	Concurrency       int
+	AutoJoin          *bool
+	APIURL            string
+	HTTPClient        *http.Client
+	Logger            *slog.Logger
 }
 
 type Summary struct {
@@ -82,7 +84,7 @@ func RunWithTokens(ctx context.Context, cfg config.Config, st *store.Store, opts
 	apiOptions := slackapi.SyncOptions{
 		WorkspaceID: opts.WorkspaceID, Channels: opts.Channels,
 		ExcludeChannels: opts.ExcludeChannels, Since: opts.Since,
-		Full: opts.Full, LatestOnly: opts.LatestOnly,
+		Full: opts.Full, LatestOnly: opts.LatestOnly, ChangedThreads: opts.ChangedThreads, SelectedDiscovery: opts.SelectedDiscovery,
 		Concurrency: opts.Concurrency, AutoJoin: opts.AutoJoin,
 	}
 
