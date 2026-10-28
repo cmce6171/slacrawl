@@ -237,7 +237,7 @@ func isLocalSyncProgress(table string, row map[string]any) bool {
 	if table != "sync_state" {
 		return false
 	}
-	return (row["entity_type"] == "history_coverage_v1" && (row["source_name"] == "api-bot" || row["source_name"] == "api-user")) ||
+	return ((row["entity_type"] == "history_coverage_v1" || row["entity_type"] == "history_resolution_v1") && (row["source_name"] == "api-bot" || row["source_name"] == "api-user")) ||
 		(row["entity_type"] == "thread_pending_v1" && (row["source_name"] == "api-user" || row["source_name"] == "mcp")) ||
 		(row["entity_type"] == "history_work_v1" && row["source_name"] == "mcp")
 }

@@ -35,6 +35,53 @@ func reusableThreadFingerprint(ctx context.Context, st *store.Store, workspace, 
 	return st.ThreadRepliesMatch(ctx, workspace, channel, ts, fingerprint.ReplyCount, fingerprint.LatestReply)
 }
 
+// Preserve retained evidence before history can overwrite reply hints. Cached,
+// locally complete roots need no job; outstanding jobs keep their generation.
+func prepareIncrementalThreadWork(ctx context.Context, st *store.Store, workspace, channel string, now time.Time, attempt *store.APIHistoryAttempt) ([]store.ThreadWork, error) {
+	work, err := st.ReconcileThreadWork(ctx, SourceUser, workspace, channel)
+	if err != nil {
+		return nil, err
+	}
+	pending := make(map[string]bool, len(work))
+	for _, item := range work {
+		pending[item.TS] = true
+	}
+	roots, err := st.ChannelThreadRoots(ctx, workspace, channel)
+	if err != nil {
+		return nil, err
+	}
+	var requests []store.ThreadWork
+	for _, root := range roots {
+		if pending[root.TS] {
+			continue
+		}
+		value, err := st.GetSyncState(ctx, SourceUser, "thread_fingerprint_v2", workspace+"|"+channel+"|"+root.TS)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+		var fingerprint threadFingerprint
+		if err == nil && json.Unmarshal([]byte(value), &fingerprint) == nil {
+			reusable, err := reusableThreadFingerprint(ctx, st, workspace, channel, root.TS, fingerprint, now, 0)
+			if err != nil {
+				return nil, err
+			}
+			if reusable {
+				continue
+			}
+		}
+		requests = append(requests, store.ThreadWork{SourceName: SourceUser, WorkspaceID: workspace, ChannelID: channel, TS: root.TS})
+	}
+	if len(requests) == 0 {
+		return work, nil
+	}
+	result, err := st.ApplyWriteBatch(ctx, store.WriteBatch{HistoryGuard: attempt, PendingThreads: requests,
+		ThreadDiscovery: &store.ThreadWorkDiscovery{SourceName: SourceUser, WorkspaceID: workspace, ChannelID: channel}})
+	if err != nil {
+		return nil, err
+	}
+	return append(work, result.PendingThreads...), nil
+}
+
 // Slack leaves old parents at their original timestamp after a first/new reply.
 // One paginated metadata traversal covers both recent ingestion and old parents.
 // Only recent messages and old roots needing replies enter the write batch.

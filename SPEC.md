@@ -496,7 +496,7 @@ once per decision. Every key must be canonical, even for a different workspace;
 after key validation, workspace-only decisions ignore foreign values. Archive-wide
 Sync and CLI Doctor evaluate every API value, while repair and Full skip cleanup
 evaluate the selected workspace. Malformed selected values fail without clearing
-state. A valid current record is incomplete when Complete is false or Pending is present, including an empty Pending. An older bounded or bot record can be superseded for evaluation by a later completed unbounded user scan of the same workspace/channel whose horizon covers the older requested horizon. Records remain stored and validated. Current unbounded user failures and newer failures cannot be superseded. Missing records are not invented. Finding pending
+state. A valid current record is incomplete when Complete is false or Pending is present, including an empty Pending. An older bounded or bot record can be superseded for evaluation by a later completed unbounded user scan of the same workspace/channel whose actual retained interval contains both bounds of the unfinished interval. Completion saves a local resolution bound to the exact historical checkpoint and its update time; a later failed attempt invalidates that resolution. Legacy records without a resolution remain partial until a covering scan succeeds. Records remain stored and validated. Current unbounded user failures and newer failures cannot be superseded. Missing records are not invented. Finding pending
 work does not bypass validation of later records.
 
 A replies collision without an owned thread generation queues or renews only the
@@ -1013,7 +1013,7 @@ User-primary `--incremental-threads` uses ordinary completed-history bounds for
 message ingestion and exhaustively scans older parent metadata separately. It
 creates durable jobs and writes old roots only when cached current reply proof
 cannot be reused. Zero-reply old parents remain in the metadata scan so their
-first replies are discoverable. Existing jobs retry even if hints disappear.
+first replies are discoverable. Existing jobs retry even if hints disappear. Retained roots without reusable local reply proof are durably queued before history writes can erase their hints; existing job generations remain unchanged.
 All metadata pages require the same identity, native success, pagination and
 history-limit validation as ordinary history. Failure prevents completed history.
 The ordinary history attempt generation guards the metadata traversal and all writes.

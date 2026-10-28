@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"strconv"
 	"strings"
@@ -16,6 +18,17 @@ import (
 )
 
 const APIHistoryEntityType = "history_coverage_v1"
+
+// One resolution per historical scope, bound to the exact unfinished checkpoint.
+// Keeping it separate preserves compatibility with canonical checkpoint readers.
+const APIHistoryResolutionEntityType = "history_resolution_v1"
+
+type apiHistoryResolution struct {
+	CheckpointSHA256    string `json:"checkpoint_sha256"`
+	CheckpointUpdatedAt string `json:"checkpoint_updated_at"`
+	Oldest              string `json:"oldest"`
+	Latest              string `json:"latest"`
+}
 
 var ErrAPIHistorySuperseded = errors.New("API history attempt was superseded; retry the selected scope")
 
@@ -169,6 +182,7 @@ func (s *Store) CompleteAPIHistory(ctx context.Context, attempt APIHistoryAttemp
 	if err != nil {
 		return err
 	}
+	attempt.Oldest, attempt.Latest = *state.Pending, state.PendingLatest
 	state.Latest = state.PendingLatest
 	state.Complete = true
 	state.Pending, state.Generation, state.PendingLatest = nil, "", ""
@@ -178,6 +192,11 @@ func (s *Store) CompleteAPIHistory(ctx context.Context, attempt APIHistoryAttemp
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if attempt.SourceName == "api-user" && attempt.Since == "" {
+		if err := resolveCoveredAPIHistory(ctx, q, attempt); err != nil {
+			return err
+		}
 	}
 	return commit()
 }
@@ -282,23 +301,29 @@ func (s *Store) HasIncompleteAPIHistory(ctx context.Context, workspaceID string)
 	return hasIncompleteAPIHistory(ctx, s.db, workspaceID)
 }
 
-func hasIncompleteAPIHistory(ctx context.Context, q storedb.DBTX, workspaceID string) (bool, error) {
-	rows, err := q.QueryContext(ctx, `select source_name, entity_id, value, updated_at from sync_state
-where source_name in ('api-bot', 'api-user') and entity_type = ?
-order by source_name, entity_id`, APIHistoryEntityType)
+func apiHistoryCoverageRecords(ctx context.Context, q storedb.DBTX, workspaceID, prefix string) ([]apiHistoryCoverageRecord, error) {
+	rows, err := q.QueryContext(ctx, `select source_name, entity_id, value, updated_at,
+ (select r.value from sync_state r where r.source_name=h.source_name and r.entity_id=h.entity_id and r.entity_type='history_resolution_v1')
+ from sync_state h
+where source_name in ('api-bot', 'api-user') and entity_type = ? and (? = '' or substr(h.entity_id,1,length(?)) = ?)
+order by source_name, entity_id`, APIHistoryEntityType, prefix, prefix, prefix)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	defer rows.Close()
 	var records []apiHistoryCoverageRecord
 	for rows.Next() {
 		var source, key, raw, updatedAt string
-		if err := rows.Scan(&source, &key, &raw, &updatedAt); err != nil {
-			return false, err
+		var resolution sql.NullString
+		if err := rows.Scan(&source, &key, &raw, &updatedAt, &resolution); err != nil {
+			return nil, err
 		}
 		scope, err := decodeAPIHistoryKey(source, key)
 		if err != nil {
-			return false, err
+			if prefix != "" {
+				continue
+			} // A completion can only resolve valid candidates. Status audits all rows.
+			return nil, err
 		}
 		// An untrusted key cannot establish workspace ownership. Once canonical,
 		// a foreign value cannot veto this workspace's cleanup or repair.
@@ -307,22 +332,37 @@ order by source_name, entity_id`, APIHistoryEntityType)
 		}
 		state, err := decodeAPIHistory(raw)
 		if err != nil {
-			return false, err
+			if prefix != "" {
+				continue
+			} // A completion can only resolve valid candidates. Status audits all rows.
+			return nil, err
 		}
 		records = append(records, apiHistoryCoverageRecord{
-			source: source, scope: scope, state: state, updatedAt: updatedAt,
+			source: source, scope: scope, state: state, updatedAt: updatedAt, raw: raw, resolution: resolution.String,
 		})
 	}
 	// Do not return early on pending work: later malformed records still veto
 	// the decision, and must never be hidden by SQL JSON filters or joins.
 	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return records, nil
+}
+
+func hasIncompleteAPIHistory(ctx context.Context, q storedb.DBTX, workspaceID string) (bool, error) {
+	records, err := apiHistoryCoverageRecords(ctx, q, workspaceID, "")
+	if err != nil {
 		return false, err
 	}
 	for _, record := range records {
 		if record.state.Complete && record.state.Pending == nil {
 			continue
 		}
-		if apiHistoryCoveredByNewerUserScan(record, records) {
+		resolved, err := apiHistoryResolved(record)
+		if err != nil {
+			return false, err
+		}
+		if resolved {
 			continue
 		}
 		return true, nil
@@ -331,43 +371,96 @@ order by source_name, entity_id`, APIHistoryEntityType)
 }
 
 type apiHistoryCoverageRecord struct {
-	source    string
-	scope     APIHistoryScope
-	state     APIHistoryState
-	updatedAt string
+	raw        string
+	resolution string
+	source     string
+	scope      APIHistoryScope
+	state      APIHistoryState
+	updatedAt  string
 }
 
-// apiHistoryCoveredByNewerUserScan only retires evaluation of an incomplete
-// historical row. The row remains in sync_state and is still decoded above.
-// A completed, unbounded api-user scan is authoritative for the same
-// workspace/channel when it was written later and covered the older attempt's
-// recorded upper horizon. An incomplete unbounded api-user row is the current
-// canonical scope and can never be hidden by this rule.
-func apiHistoryCoveredByNewerUserScan(record apiHistoryCoverageRecord, records []apiHistoryCoverageRecord) bool {
-	if record.source == "api-user" && record.scope.Since == "" {
+// Resolution is recorded only while committing a successful scan whose actual
+// requested interval contains the unfinished interval. A newer horizon alone
+// says nothing about data below a retention floor or incremental lower bound.
+func resolveCoveredAPIHistory(ctx context.Context, q storedb.DBTX, attempt APIHistoryAttempt) error {
+	if attempt.EnforceRetention {
+		floor, err := retentionFloor(ctx, q, attempt.WorkspaceID, attempt.ChannelID)
+		if err != nil {
+			return err
+		}
+		attempt.Oldest = (ChannelSyncCursor{RetentionFloor: floor}).ApplyRetentionFloor(attempt.Oldest)
+	}
+	identity, err := json.Marshal([2]string{attempt.WorkspaceID, attempt.ChannelID})
+	if err != nil {
+		return err
+	}
+	prefix := string(identity[:len(identity)-1]) + ","
+	records, err := apiHistoryCoverageRecords(ctx, q, attempt.WorkspaceID, prefix)
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		if record.scope.ChannelID != attempt.ChannelID || (record.state.Complete && record.state.Pending == nil) ||
+			(record.source == "api-user" && record.scope.Since == "") || !apiHistoryIntervalCovers(record, attempt.Oldest, attempt.Latest) {
+			continue
+		}
+		key, _ := record.scope.key()
+		proof := apiHistoryResolution{CheckpointSHA256: fmt.Sprintf("%x", sha256.Sum256([]byte(record.raw))),
+			CheckpointUpdatedAt: record.updatedAt, Oldest: attempt.Oldest, Latest: attempt.Latest}
+		raw, err := json.Marshal(proof)
+		if err != nil {
+			return err
+		}
+		if err := storedb.New(q).SetSyncState(ctx, storedb.SetSyncStateParams{SourceName: record.source,
+			EntityType: APIHistoryResolutionEntityType, EntityID: key, Value: string(raw), UpdatedAt: formatDBTime(time.Now().UTC())}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func apiHistoryResolved(record apiHistoryCoverageRecord) (bool, error) {
+	if record.resolution == "" || (record.source == "api-user" && record.scope.Since == "") {
+		return false, nil
+	}
+	var proof apiHistoryResolution
+	if json.Unmarshal([]byte(record.resolution), &proof) != nil {
+		return false, errors.New("invalid API history resolution")
+	}
+	canonical, err := json.Marshal(proof)
+	if err != nil || string(canonical) != record.resolution || len(proof.CheckpointSHA256) != 64 || parseDBTime(proof.CheckpointUpdatedAt).IsZero() {
+		return false, errors.New("invalid API history resolution")
+	}
+	if _, err := apiHistoryTimestamp(proof.Latest); err != nil {
+		return false, err
+	}
+	if proof.Oldest != "" {
+		if _, err := apiHistoryTimestamp(proof.Oldest); err != nil {
+			return false, err
+		}
+	}
+	return proof.CheckpointSHA256 == fmt.Sprintf("%x", sha256.Sum256([]byte(record.raw))) &&
+		proof.CheckpointUpdatedAt == record.updatedAt && apiHistoryIntervalCovers(record, proof.Oldest, proof.Latest), nil
+}
+
+func apiHistoryIntervalCovers(record apiHistoryCoverageRecord, oldest, latest string) bool {
+	if record.state.Pending == nil {
 		return false
 	}
 	horizon, ok := apiHistoryIncompleteHorizon(record)
-	if !ok {
+	upper, err := apiHistoryTimestamp(latest)
+	if !ok || err != nil || upper < horizon {
 		return false
 	}
-	for _, candidate := range records {
-		if candidate.source != "api-user" || candidate.scope.Since != "" ||
-			candidate.scope.WorkspaceID != record.scope.WorkspaceID || candidate.scope.ChannelID != record.scope.ChannelID ||
-			!candidate.state.Complete || candidate.state.Pending != nil {
-			continue
-		}
-		latest, _ := apiHistoryTimestamp(candidate.state.Latest)
-		if latest < horizon {
-			continue
-		}
-		candidateAt, staleAt := parseDBTime(candidate.updatedAt), parseDBTime(record.updatedAt)
-		if candidateAt.IsZero() || staleAt.IsZero() || !candidateAt.After(staleAt) {
-			continue
-		}
+	if oldest == "" {
 		return true
 	}
-	return false
+	if *record.state.Pending == "" {
+		return false
+	}
+	lower, err := apiHistoryTimestamp(oldest)
+	target, targetErr := apiHistoryTimestamp(*record.state.Pending)
+	return err == nil && targetErr == nil && lower <= target
 }
 
 func apiHistoryIncompleteHorizon(record apiHistoryCoverageRecord) (float64, bool) {

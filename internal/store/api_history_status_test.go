@@ -60,21 +60,137 @@ func TestAPIHistoryStatusSupersedesOlderCoveredScopes(t *testing.T) {
 	seedAPIHistoryState(t, st, APIHistoryScope{SourceName: "api-user", WorkspaceID: "T1", ChannelID: "C1"}, APIHistoryState{
 		Complete: true, Latest: "1710000300.000000",
 	})
-	_, err := st.DB().ExecContext(ctx, `update sync_state set updated_at='2026-10-28T18:00:00Z'
-	where source_name='api-user' and entity_type=? and entity_id='["T1","C1","1710000000.000000"]'`, APIHistoryEntityType)
+	seedBatchCatalog(t, st, "T1", "C1", "U1", time.Unix(1710000000, 0))
+	attempt, err := st.BeginAPIHistory(ctx, APIHistoryScope{SourceName: "api-user", WorkspaceID: "T1", ChannelID: "C1"}, APIHistoryOptions{Full: true, RestoreRequested: true}, "1710000400.000000")
 	require.NoError(t, err)
-	_, err = st.DB().ExecContext(ctx, `update sync_state set updated_at='2026-10-28T18:30:00Z'
-where source_name='api-bot' and entity_type=? and entity_id='["T1","C1",""]'`, APIHistoryEntityType)
-	require.NoError(t, err)
-	_, err = st.DB().ExecContext(ctx, `update sync_state set updated_at='2026-10-28T19:00:00Z'
-where source_name='api-user' and entity_type=? and entity_id='["T1","C1",""]'`, APIHistoryEntityType)
-	require.NoError(t, err)
+	require.NoError(t, st.CompleteAPIHistory(ctx, attempt))
 
 	before := apiHistoryArchiveRows(t, st)
 	incomplete, err := st.HasIncompleteAPIHistory(ctx, "")
 	require.NoError(t, err)
 	require.False(t, incomplete, "newer completed unbounded user history covers older bounded and bot attempts")
 	require.Equal(t, before, apiHistoryArchiveRows(t, st), "coverage evaluation preserves historical rows")
+}
+
+func TestAPIHistoryStatusDoesNotSupersedeBelowRetentionFloor(t *testing.T) {
+	ctx := context.Background()
+	st := openBatchTestStore(t)
+	seedBatchCatalog(t, st, "T1", "C1", "U1", time.Unix(1710000000, 0))
+	require.NoError(t, st.SetSyncState(ctx, retentionFloorSource, retentionFloorEntityType, "T1|C1", "1710000000.000000"))
+
+	// This bounded restoration started below the local retention floor and then
+	// failed before completion. A later ordinary scan starts at the floor, so
+	// its newer upper horizon cannot prove that the earlier interval is covered.
+	restoreScope := APIHistoryScope{SourceName: "api-user", WorkspaceID: "T1", ChannelID: "C1", Since: "1700000000.000000"}
+	_, err := st.BeginAPIHistory(ctx, restoreScope, APIHistoryOptions{RestoreRequested: true}, "1710000100.000000")
+	require.NoError(t, err)
+
+	ordinaryScope := APIHistoryScope{SourceName: "api-user", WorkspaceID: "T1", ChannelID: "C1"}
+	ordinary, err := st.BeginAPIHistory(ctx, ordinaryScope, APIHistoryOptions{}, "1710000200.000000")
+	require.NoError(t, err)
+	require.Equal(t, "1710000000.000000", ordinary.Oldest)
+	require.True(t, ordinary.Inclusive)
+	require.NoError(t, st.CompleteAPIHistory(ctx, ordinary))
+
+	incomplete, err := st.HasIncompleteAPIHistory(ctx, "T1")
+	require.NoError(t, err)
+	require.True(t, incomplete, "a floor-bounded scan cannot retire a failed restoration below that floor")
+}
+
+func TestAPIHistoryStatusFullRestoreCanSupersedeOlderBoundedAttempt(t *testing.T) {
+	ctx := context.Background()
+	st := openBatchTestStore(t)
+	seedBatchCatalog(t, st, "T1", "C1", "U1", time.Unix(1710000000, 0))
+
+	bounded := APIHistoryScope{SourceName: "api-user", WorkspaceID: "T1", ChannelID: "C1", Since: "1700000000.000000"}
+	_, err := st.BeginAPIHistory(ctx, bounded, APIHistoryOptions{RestoreRequested: true}, "1710000100.000000")
+	require.NoError(t, err)
+
+	fullScope := APIHistoryScope{SourceName: "api-user", WorkspaceID: "T1", ChannelID: "C1"}
+	full, err := st.BeginAPIHistory(ctx, fullScope, APIHistoryOptions{Full: true, RestoreRequested: true}, "1710000200.000000")
+	require.NoError(t, err)
+	require.Equal(t, "", full.Oldest)
+	require.NoError(t, st.CompleteAPIHistory(ctx, full))
+
+	incomplete, err := st.HasIncompleteAPIHistory(ctx, "T1")
+	require.NoError(t, err)
+	require.False(t, incomplete, "a completed unbounded restore contains the failed bounded interval")
+}
+
+func TestAPIHistoryStatusFullRestoreProofSurvivesOrdinaryPoll(t *testing.T) {
+	ctx := context.Background()
+	st := openBatchTestStore(t)
+	seedBatchCatalog(t, st, "T1", "C1", "U1", time.Unix(1710000000, 0))
+	require.NoError(t, st.SetSyncState(ctx, retentionFloorSource, retentionFloorEntityType, "T1|C1", "1710000000.000000"))
+
+	bounded := APIHistoryScope{SourceName: "api-user", WorkspaceID: "T1", ChannelID: "C1", Since: "1700000000.000000"}
+	_, err := st.BeginAPIHistory(ctx, bounded, APIHistoryOptions{RestoreRequested: true}, "1710000100.000000")
+	require.NoError(t, err)
+
+	scope := APIHistoryScope{SourceName: "api-user", WorkspaceID: "T1", ChannelID: "C1"}
+	full, err := st.BeginAPIHistory(ctx, scope, APIHistoryOptions{Full: true, RestoreRequested: true}, "1710000200.000000")
+	require.NoError(t, err)
+	require.NoError(t, st.CompleteAPIHistory(ctx, full))
+	ordinary, err := st.BeginAPIHistory(ctx, scope, APIHistoryOptions{}, "1710000300.000000")
+	require.NoError(t, err)
+	require.NoError(t, st.CompleteAPIHistory(ctx, ordinary))
+
+	incomplete, err := st.HasIncompleteAPIHistory(ctx, "T1")
+	require.NoError(t, err)
+	require.False(t, incomplete, "a later ordinary poll must not erase the full restore's coverage proof")
+	var count int
+	require.NoError(t, st.DB().QueryRowContext(ctx, "select count(*) from sync_state where entity_type=?", APIHistoryResolutionEntityType).Scan(&count))
+	require.Equal(t, 1, count, "proof count is bounded by historical scopes, not refresh count")
+	_, err = st.BeginAPIHistory(ctx, bounded, APIHistoryOptions{RestoreRequested: true}, "1710000400.000000")
+	require.NoError(t, err)
+	ordinary, err = st.BeginAPIHistory(ctx, scope, APIHistoryOptions{}, "1710000500.000000")
+	require.NoError(t, err)
+	require.NoError(t, st.CompleteAPIHistory(ctx, ordinary))
+	incomplete, err = st.HasIncompleteAPIHistory(ctx, "T1")
+	require.NoError(t, err)
+	require.True(t, incomplete, "a new failed historical scan invalidates the old resolution")
+}
+
+func TestAPIHistoryStatusDoesNotUseLegacyUpperBoundAlone(t *testing.T) {
+	ctx := context.Background()
+	st := openBatchTestStore(t)
+	seedAPIHistoryState(t, st, APIHistoryScope{SourceName: "api-user", WorkspaceID: "T1", ChannelID: "C1", Since: "1700000000.000000"}, APIHistoryState{
+		Pending: new("1700000000.000000"), Generation: "restore-generation", PendingLatest: "1710000100.000000",
+	})
+	seedAPIHistoryState(t, st, APIHistoryScope{SourceName: "api-user", WorkspaceID: "T1", ChannelID: "C1"}, APIHistoryState{
+		Complete: true, Latest: "1710000200.000000",
+	})
+	_, err := st.DB().ExecContext(ctx, `update sync_state set updated_at='2026-10-28T18:00:00Z'
+where source_name='api-user' and entity_type=? and entity_id='["T1","C1","1700000000.000000"]'`, APIHistoryEntityType)
+	require.NoError(t, err)
+	_, err = st.DB().ExecContext(ctx, `update sync_state set updated_at='2026-10-28T19:00:00Z'
+where source_name='api-user' and entity_type=? and entity_id='["T1","C1",""]'`, APIHistoryEntityType)
+	require.NoError(t, err)
+
+	incomplete, err := st.HasIncompleteAPIHistory(ctx, "T1")
+	require.NoError(t, err)
+	require.True(t, incomplete, "legacy completed checkpoints have no lower-bound proof")
+}
+
+func TestAPIHistoryStatusKeepsNewerUserFailureVisible(t *testing.T) {
+	ctx := context.Background()
+	st := openBatchTestStore(t)
+	seedAPIHistoryState(t, st, APIHistoryScope{SourceName: "api-user", WorkspaceID: "T1", ChannelID: "C1", Since: "1700000000.000000"}, APIHistoryState{
+		Pending: new("1700000000.000000"), Generation: "restore-generation", PendingLatest: "1710000100.000000",
+	})
+	seedAPIHistoryState(t, st, APIHistoryScope{SourceName: "api-user", WorkspaceID: "T1", ChannelID: "C1"}, APIHistoryState{
+		Pending: new(""), Generation: "newer-generation", PendingLatest: "1710000200.000000",
+	})
+	_, err := st.DB().ExecContext(ctx, `update sync_state set updated_at='2026-10-28T18:00:00Z'
+where source_name='api-user' and entity_type=? and entity_id='["T1","C1","1700000000.000000"]'`, APIHistoryEntityType)
+	require.NoError(t, err)
+	_, err = st.DB().ExecContext(ctx, `update sync_state set updated_at='2026-10-28T19:00:00Z'
+where source_name='api-user' and entity_type=? and entity_id='["T1","C1",""]'`, APIHistoryEntityType)
+	require.NoError(t, err)
+
+	incomplete, err := st.HasIncompleteAPIHistory(ctx, "T1")
+	require.NoError(t, err)
+	require.True(t, incomplete, "a newer failed scan cannot prove completion")
 }
 
 func TestAPIHistoryStatusKeepsNewerFailureVisible(t *testing.T) {
@@ -384,4 +500,18 @@ func cleanupAPIThreadSkipsForTest(ctx context.Context, st *Store, workspaceID st
 		return err
 	}
 	return commit()
+}
+
+func TestAPIHistoryResolutionLeavesUnrelatedMalformedRowsToStatus(t *testing.T) {
+	ctx := context.Background()
+	st := openBatchTestStore(t)
+	seedBatchCatalog(t, st, "T1", "C1", "U1", time.Unix(1710000000, 0))
+	require.NoError(t, st.SetSyncState(ctx, "api-user", APIHistoryEntityType, "malformed-key", "{invalid"))
+	require.NoError(t, st.SetSyncState(ctx, "api-user", APIHistoryEntityType, `["T1","C2",""]`, "{invalid"))
+	require.NoError(t, st.SetSyncState(ctx, "api-user", APIHistoryEntityType, `["T1","C1","1700000000"]`, "{invalid"))
+	attempt, err := st.BeginAPIHistory(ctx, APIHistoryScope{SourceName: "api-user", WorkspaceID: "T1", ChannelID: "C1"}, APIHistoryOptions{Full: true}, "1710000200.000000")
+	require.NoError(t, err)
+	require.NoError(t, st.CompleteAPIHistory(ctx, attempt), "selected completion does not audit unrelated records")
+	_, err = st.HasIncompleteAPIHistory(ctx, "")
+	require.Error(t, err, "archive-wide status still rejects malformed records")
 }

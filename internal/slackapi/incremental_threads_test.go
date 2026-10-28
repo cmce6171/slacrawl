@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -192,4 +193,59 @@ func TestIncrementalThreadsRetriesDurableWorkAfterReplyHintLoss(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, jobs)
 	require.Equal(t, 3, calls)
+}
+
+func TestIncrementalThreadsPreservesUnqueuedHintsAfterFailedSince(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "archive.db")
+	st, err := store.Open(path)
+	require.NoError(t, err)
+	defer func() { _ = st.Close() }()
+	now := time.Unix(1793000000, 0).UTC()
+	stage, calls := 0, 0
+	client := primaryOwnerClient(t, config.Tokens{User: "fixture-user"}, func(r *http.Request, form url.Values) (any, error) {
+		parent := map[string]any{"ts": "1710000001.000000", "text": "root", "reply_count": 1, "latest_reply": "1710000002.000000"}
+		switch r.URL.Path {
+		case "/conversations.history":
+			if stage > 0 {
+				return map[string]any{"ok": true, "messages": []any{map[string]any{"ts": "1710000001.000000", "text": "root"}}}, nil
+			}
+			return map[string]any{"ok": true, "messages": []any{parent}}, nil
+		case "/conversations.replies":
+			calls++
+			if stage < 2 {
+				return map[string]any{"ok": false, "error": "fixture_failure"}, nil
+			}
+			return map[string]any{"ok": true, "messages": []any{parent, map[string]any{"ts": "1710000002.000000", "thread_ts": "1710000001.000000", "text": "reply"}}}, nil
+		}
+		return primaryOwnerResponse(r.URL.Path), nil
+	})
+	client.now = func() time.Time { return now }
+	require.Error(t, client.Sync(ctx, st, SyncOptions{WorkspaceID: "T123", Since: "1700000000.000000"}))
+	jobs, err := st.PendingThreadWork(ctx, SourceUser, "T123", "C123")
+	require.NoError(t, err)
+	require.Empty(t, jobs, "explicit Since leaves ordinary backlog untouched")
+	stage = 1
+	now = now.Add(time.Minute)
+	require.Error(t, client.Sync(ctx, st, SyncOptions{WorkspaceID: "T123", IncrementalThreads: true}), "retained reply evidence must survive history hint loss")
+	jobs, err = st.PendingThreadWork(ctx, SourceUser, "T123", "C123")
+	require.NoError(t, err)
+	require.Len(t, jobs, 1)
+	generation := jobs[0].Generation
+	require.NoError(t, st.Close())
+	st, err = store.Open(path)
+	require.NoError(t, err)
+	jobs, err = st.PendingThreadWork(ctx, SourceUser, "T123", "C123")
+	require.NoError(t, err)
+	require.Equal(t, generation, jobs[0].Generation)
+	stage = 2
+	now = now.Add(time.Minute)
+	require.NoError(t, client.Sync(ctx, st, SyncOptions{WorkspaceID: "T123", IncrementalThreads: true}))
+	require.Equal(t, 3, calls)
+	jobs, err = st.PendingThreadWork(ctx, SourceUser, "T123", "C123")
+	require.NoError(t, err)
+	require.Empty(t, jobs)
+	rows, err := st.QueryReadOnly(ctx, "select ts from messages where thread_ts='1710000001.000000' and ts<>thread_ts")
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
 }

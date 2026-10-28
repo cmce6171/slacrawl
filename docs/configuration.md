@@ -127,7 +127,7 @@ channel. Coverage decisions separately scan retained records for the exact API
 sources and history type. Every key must be canonical; workspace-only decisions
 ignore a foreign value only after validating its key. Sync and CLI Doctor use an
 archive-wide view, while repair and Full skip cleanup use the selected workspace.
-Malformed relevant records fail without resetting or deleting them. Current pending work, including an empty pending bound, or a record without completed history keeps coverage partial. An older bounded or bot checkpoint is historical when a later completed unbounded user scan of the same workspace/channel covers its requested horizon. All records still validate; newer failures, current unbounded failures, jobs and skips remain visible. Historical records are preserved. Missing records do not invent completion.
+Malformed relevant records fail without resetting or deleting them. Current pending work, including an empty pending bound, or a record without completed history keeps coverage partial. An older bounded or bot checkpoint is historical when a later completed unbounded user scan of the same workspace/channel covers both bounds of its unfinished interval. A local resolution binds that successful scan to the exact historical checkpoint; it survives later incremental polls but cannot hide a new failure. Legacy records without this evidence remain partial until a covering scan succeeds. All records still validate; newer failures, current unbounded failures, jobs and skips remain visible. Historical records are preserved. Missing records do not invent completion.
 
 These checks do not fence older unconditional writers or skip diagnostics shared
 by different history scopes. Status reads counts, freshness and the coverage
@@ -1349,7 +1349,7 @@ This is incremental ingestion, not a delta-only Slack API: history permissions d
 not supply an old-thread change feed. Every poll must still inspect old parent
 metadata. Unchanged reply proof does not expire in this mode: fresh parent counts
 and latest-reply timestamps must still match both the prior successful fetch and
-the live local reply rows. Existing pending work and skips force retry. This does
+the live local reply rows. Existing pending work and skips force retry. Before history writes, retained roots without reusable proof enter the durable queue, so missing reply hints cannot erase unfinished work. This does
 not discover hidden delete events or immediately detect edits to unchanged old
 message bodies. Age-based rereads belong in the separate full reconciliation.
 

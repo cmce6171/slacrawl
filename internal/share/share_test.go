@@ -1184,6 +1184,7 @@ func TestHistoryCheckpointsStayLocalOnExport(t *testing.T) {
 			require.NoError(t, err)
 			for _, sourceName := range []string{"api-bot", "api-user"} {
 				require.NoError(t, source.SetSyncState(ctx, sourceName, "history_coverage_v1", "opaque", "{not json"))
+				require.NoError(t, source.SetSyncState(ctx, sourceName, "history_resolution_v1", "opaque", "{not json"))
 			}
 			var expected []map[string]any
 			if mixed {
@@ -1242,6 +1243,8 @@ func TestHistoryCheckpointsIgnoredByMergeAndRestore(t *testing.T) {
 					historySnapshotRow("api-bot", "history_coverage_v1", "same", "foreign"),
 					historySnapshotRow("api-user", "history_coverage_v1", "absent", "foreign"),
 					historySnapshotRow("api-bot", "history_coverage_v1", "malformed key", "{not json"),
+					historySnapshotRow("api-user", "history_resolution_v1", "absent", "foreign"),
+					historySnapshotRow("api-bot", "history_resolution_v1", "absent", "{not json"),
 					historySnapshotRow("mcp", "history_coverage_v1", "connector", "foreign"),
 					historySnapshotRow("provider:test", "cursor", "cursor", "foreign"),
 					historySnapshotRow("api-bot", "history_coverage_v2", "future", "foreign"),
@@ -1261,7 +1264,7 @@ func TestHistoryCheckpointsIgnoredByMergeAndRestore(t *testing.T) {
 				}
 				_, err = importer(ctx, reader, opts)
 				require.NoError(t, err)
-				targeted, err := reader.QueryReadOnly(ctx, `select source_name,entity_id,value from sync_state where entity_type = 'history_coverage_v1' and source_name in ('api-bot','api-user') order by source_name,entity_id`)
+				targeted, err := reader.QueryReadOnly(ctx, `select source_name,entity_id,value from sync_state where entity_type in ('history_coverage_v1','history_resolution_v1') and source_name in ('api-bot','api-user') order by source_name,entity_id`)
 				require.NoError(t, err)
 				if restore {
 					require.Empty(t, targeted)
@@ -1271,7 +1274,7 @@ func TestHistoryCheckpointsIgnoredByMergeAndRestore(t *testing.T) {
 						{"source_name": "api-user", "entity_id": "local-only", "value": "pending"},
 					}, targeted)
 				}
-				for _, row := range incoming[3:] {
+				for _, row := range incoming[5:] {
 					value, err := reader.GetSyncState(ctx, row["source_name"].(string), row["entity_type"].(string), row["entity_id"].(string))
 					require.NoError(t, err)
 					expected := row["value"]

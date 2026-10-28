@@ -80,7 +80,7 @@ func (c *Client) syncChannelMessagesWithSource(ctx context.Context, st *store.St
 		var work []store.ThreadWork
 		var err error
 		if source.incrementalThreads {
-			work, err = st.ReconcileThreadWork(ctx, SourceUser, workspaceID, channel.ID)
+			work, err = prepareIncrementalThreadWork(ctx, st, workspaceID, channel.ID, now, &attempt)
 		} else {
 			work, err = st.PrepareThreadWork(ctx, SourceUser, workspaceID, channel.ID, &attempt)
 		}
@@ -89,6 +89,9 @@ func (c *Client) syncChannelMessagesWithSource(ctx context.Context, st *store.St
 		}
 		for _, item := range work {
 			pendingThreads[item.TS] = item
+			if source.incrementalThreads {
+				preexistingWork[item.TS] = true
+			}
 		}
 	}
 	syncThreadOnce := func(threadTS string) error {
