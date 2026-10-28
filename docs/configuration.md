@@ -1347,9 +1347,11 @@ Search permissions and search-index completeness are not required.
 
 This is incremental ingestion, not a delta-only Slack API: history permissions do
 not supply an old-thread change feed. Every poll must still inspect old parent
-metadata. Cached reply proof remains conservative and expires after 24 hours.
-Existing pending work and skips force retry. This does not discover hidden delete
-events or immediately detect edits to unchanged old message bodies.
+metadata. Unchanged reply proof does not expire in this mode: fresh parent counts
+and latest-reply timestamps must still match both the prior successful fetch and
+the live local reply rows. Existing pending work and skips force retry. This does
+not discover hidden delete events or immediately detect edits to unchanged old
+message bodies. Age-based rereads belong in the separate full reconciliation.
 
 Run a separate `sync --source api --full --auto-join=false` for full reconciliation
 of old message bodies and all replies. Successful matching full thread reads also

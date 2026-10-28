@@ -12,7 +12,7 @@ import (
 	"github.com/openclaw/slacrawl/internal/store"
 )
 
-func reusableThreadFingerprint(ctx context.Context, st *store.Store, workspace, channel, ts string, fingerprint threadFingerprint, now time.Time) (bool, error) {
+func reusableThreadFingerprint(ctx context.Context, st *store.Store, workspace, channel, ts string, fingerprint threadFingerprint, now time.Time, maxAge time.Duration) (bool, error) {
 	key := workspace + "|" + channel + "|" + ts
 	value, err := st.GetSyncState(ctx, SourceUser, "thread_fingerprint_v2", key)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -22,7 +22,7 @@ func reusableThreadFingerprint(ctx context.Context, st *store.Store, workspace, 
 		return false, err
 	}
 	var previous threadFingerprint
-	if json.Unmarshal([]byte(value), &previous) != nil || previous.ReplyCount != fingerprint.ReplyCount || previous.LatestReply != fingerprint.LatestReply || fingerprint.LatestReply == "" || now.Before(previous.CheckedAt) || now.Sub(previous.CheckedAt) >= 24*time.Hour {
+	if json.Unmarshal([]byte(value), &previous) != nil || previous.CheckedAt.IsZero() || previous.ReplyCount != fingerprint.ReplyCount || previous.LatestReply != fingerprint.LatestReply || fingerprint.LatestReply == "" || now.Before(previous.CheckedAt) || (maxAge > 0 && now.Sub(previous.CheckedAt) >= maxAge) {
 		return false, nil
 	}
 	_, err = st.GetSyncState(ctx, SourceUser, "thread_skip", key)
@@ -62,7 +62,7 @@ func incrementalHistoryWrites(ctx context.Context, st *store.Store, workspace, c
 		}
 		fingerprint := threadFingerprint{ReplyCount: m.ReplyCount, LatestReply: m.LatestReply}
 		if !preexisting[m.Timestamp] {
-			same, err := reusableThreadFingerprint(ctx, st, workspace, channel, m.Timestamp, fingerprint, now)
+			same, err := reusableThreadFingerprint(ctx, st, workspace, channel, m.Timestamp, fingerprint, now, 0)
 			if err != nil {
 				return nil, err
 			}

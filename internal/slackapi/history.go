@@ -129,7 +129,13 @@ func (c *Client) syncChannelMessagesWithSource(ctx context.Context, st *store.St
 		unchanged := false
 		if source.changedThreads && observed && !preexistingWork[threadTS] {
 			var err error
-			unchanged, err = reusableThreadFingerprint(ctx, st, workspaceID, channel.ID, threadTS, fingerprint, now)
+			maxAge := 24 * time.Hour
+			if source.incrementalThreads {
+				// Scheduled full reconciliation owns age-based rereads. Polls
+				// only fetch changed metadata or missing local replies.
+				maxAge = 0
+			}
+			unchanged, err = reusableThreadFingerprint(ctx, st, workspaceID, channel.ID, threadTS, fingerprint, now, maxAge)
 			if err != nil {
 				return err
 			}

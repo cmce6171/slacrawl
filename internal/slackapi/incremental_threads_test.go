@@ -81,6 +81,9 @@ func TestIncrementalThreadsFindsFirstAndLaterRepliesToOldParents(t *testing.T) {
 	require.NoError(t, client.Sync(ctx, st, opts))
 	require.Equal(t, 3, calls, "matching parent metadata must not hide missing live local replies")
 	now = now.Add(25 * time.Hour)
+	require.NoError(t, client.Sync(ctx, st, opts))
+	require.Equal(t, 3, calls, "unchanged threads do not expire in the fast path; reconciliation runs separately")
+	now = now.Add(time.Minute)
 	require.NoError(t, client.Sync(ctx, st, SyncOptions{WorkspaceID: "T123", Full: true}))
 	require.Equal(t, 4, calls, "separate full reconciliation rereads unchanged replies")
 	now = now.Add(time.Minute)
@@ -142,7 +145,11 @@ func TestIncrementalThreadsRetriesDurableWorkAfterReplyHintLoss(t *testing.T) {
 	calls := 0
 	generation := ""
 	client := primaryOwnerClient(t, config.Tokens{User: "fixture-user"}, func(r *http.Request, form url.Values) (any, error) {
-		parent := map[string]any{"ts": "1710000001.000000", "text": "root", "reply_count": 1, "latest_reply": "1793000001.000000"}
+		count := 1
+		if stage > 0 {
+			count = 2
+		}
+		parent := map[string]any{"ts": "1710000001.000000", "text": "root", "reply_count": count, "latest_reply": strconv.FormatInt(1793000000+int64(count), 10) + ".000000"}
 		switch r.URL.Path {
 		case "/conversations.history":
 			if stage == 2 {
@@ -160,7 +167,11 @@ func TestIncrementalThreadsRetriesDurableWorkAfterReplyHintLoss(t *testing.T) {
 				require.Len(t, jobs, 1)
 				require.Equal(t, generation, jobs[0].Generation)
 			}
-			return map[string]any{"ok": true, "messages": []any{parent, map[string]any{"ts": "1793000001.000000", "thread_ts": "1710000001.000000", "text": "reply"}}}, nil
+			messages := []any{parent}
+			for i := 1; i <= count; i++ {
+				messages = append(messages, map[string]any{"ts": strconv.FormatInt(1793000000+int64(i), 10) + ".000000", "thread_ts": "1710000001.000000", "text": "reply"})
+			}
+			return map[string]any{"ok": true, "messages": messages}, nil
 		}
 		return primaryOwnerResponse(r.URL.Path), nil
 	})
