@@ -122,6 +122,13 @@ Run an incremental API refresh after the first sync:
 slacrawl sync --source bot
 ```
 
+For a user-token archive, `slacrawl sync --source api --incremental-threads`
+checks old parent metadata, including zero-reply parents, while writing only recent
+messages and roots needing reply work. It still paginates old parent metadata;
+Slack history does not supply an old-thread change feed. Run `sync --source api
+--full` separately for full message/reply reconciliation. See
+[incremental polling](docs/configuration.md#incremental-polling-with-old-thread-detection).
+
 Use `--latest-only` to update only channels that already have local history, `tail` for Socket Mode events, or `watch` for recurring desktop-cache refreshes. Ordinary incremental sync preserves retention cutoffs; `--full`, an older explicit `--since`, desktop ingestion, or imports can deliberately restore older records.
 
 API sync retains valid fetched pages but reports an error when Slack still signals more results without a continuation cursor, or reports a history/message limit. The attempted interval stays pending instead of advancing successful coverage. See [API history completeness](docs/configuration.md#api-history-completeness).

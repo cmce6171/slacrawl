@@ -1016,5 +1016,5 @@ cannot be reused. Zero-reply old parents remain in the metadata scan so their
 first replies are discoverable. Existing jobs retry even if hints disappear.
 All metadata pages require the same identity, native success, pagination and
 history-limit validation as ordinary history. Failure prevents completed history.
-The ordinary history attempt generation guards both passes and their writes.
+The ordinary history attempt generation guards the metadata traversal and all writes.
 Full reconciliation remains a separate explicit full message/reply traversal.
