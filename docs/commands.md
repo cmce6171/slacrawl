@@ -325,3 +325,10 @@ For a seeded archive that only needs fresh deltas:
 slacrawl sync --source bot --latest-only
 slacrawl digest --since 7d
 ```
+
+For user-token scheduled refreshes, `sync --source api --incremental-threads`
+ingests recent history while checking old parent metadata for new replies,
+including the first reply on an old message. It avoids rewriting unchanged old
+messages, but must still paginate their metadata. Run `sync --source api --full`
+separately for full message/reply reconciliation. See
+[Incremental polling](configuration.md#incremental-polling-with-old-thread-detection).

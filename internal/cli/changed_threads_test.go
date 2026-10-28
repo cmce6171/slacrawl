@@ -53,3 +53,22 @@ func TestChangedThreadsCLI(t *testing.T) {
 		require.ErrorContains(t, app.Run(context.Background(), append([]string{"--config", path, "sync"}, flags...)), "changed-threads requires")
 	}
 }
+
+func TestIncrementalThreadsCLI(t *testing.T) {
+	cfg, path := userPrimaryConfig(t)
+	cfg.WorkspaceID = "T123"
+	cfg.Sync.IncludeDMs = new(false)
+	t.Setenv(cfg.Slack.User.TokenEnv, "fixture-user")
+	require.NoError(t, cfg.Save(path))
+	fixture := &changedThreadTransport{}
+	var stdout, stderr bytes.Buffer
+	app := &App{Stdout: &stdout, Stderr: &stderr, apiURL: "https://fixture.invalid/", httpClient: &http.Client{Transport: fixture}}
+	args := []string{"--config", path, "--json", "sync", "--source", "api", "--incremental-threads", "--auto-join=false", "--with-media=false"}
+	require.NoError(t, app.Run(context.Background(), args))
+	require.Equal(t, 1, fixture.replies)
+	require.NoError(t, app.Run(context.Background(), args))
+	require.Equal(t, 1, fixture.replies)
+	for _, flags := range [][]string{{"--full"}, {"--since", "1710000000"}, {"--latest-only"}, {"--changed-threads"}, {"--source", "desktop"}} {
+		require.ErrorContains(t, app.Run(context.Background(), append(args, flags...)), "incremental-threads requires")
+	}
+}

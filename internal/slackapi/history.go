@@ -2,7 +2,6 @@ package slackapi
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,7 +34,30 @@ func (c *Client) syncChannelMessagesWithSource(ctx context.Context, st *store.St
 		return err
 	}
 	oldest, horizon := attempt.Oldest, attempt.Latest
+	requestOldest := oldest
+	historyPageSize := 200
+	if source.incrementalThreads {
+		historyPageSize = 999
+	}
+	knownOldRoots := map[string]bool{}
+	if source.incrementalThreads && oldest != "" {
+		requestOldest, err = st.ChannelRetentionFloor(ctx, workspaceID, channel.ID)
+		if err != nil {
+			return err
+		}
+		roots, err := st.ChannelThreadRoots(ctx, workspaceID, channel.ID)
+		if err != nil {
+			return err
+		}
+		for _, root := range roots {
+			knownOldRoots[root.TS] = true
+		}
+	}
+
 	enforceRetention, inclusive := attempt.EnforceRetention, attempt.Inclusive
+	if source.incrementalThreads && requestOldest != "" {
+		inclusive = true
+	}
 	checkAttempt := func() error { return st.CheckAPIHistory(ctx, attempt) }
 	historyIncomplete := false
 	syncedThreads := map[string]struct{}{}
@@ -55,7 +77,13 @@ func (c *Client) syncChannelMessagesWithSource(ctx context.Context, st *store.St
 	var discovery *store.ThreadWorkDiscovery
 	if source.retainedThreads {
 		discovery = &store.ThreadWorkDiscovery{SourceName: SourceUser, WorkspaceID: workspaceID, ChannelID: channel.ID, ExcludedTS: completedThreads}
-		work, err := st.PrepareThreadWork(ctx, SourceUser, workspaceID, channel.ID, &attempt)
+		var work []store.ThreadWork
+		var err error
+		if source.incrementalThreads {
+			work, err = st.ReconcileThreadWork(ctx, SourceUser, workspaceID, channel.ID)
+		} else {
+			work, err = st.PrepareThreadWork(ctx, SourceUser, workspaceID, channel.ID, &attempt)
+		}
 		if err != nil {
 			return err
 		}
@@ -100,29 +128,13 @@ func (c *Client) syncChannelMessagesWithSource(ctx context.Context, st *store.St
 		fingerprint, observed := observedThreads[threadTS]
 		unchanged := false
 		if source.changedThreads && observed && !preexistingWork[threadTS] {
-			value, readErr := st.GetSyncState(ctx, SourceUser, "thread_fingerprint_v2", threadKey)
-			if readErr != nil && !errors.Is(readErr, sql.ErrNoRows) {
-				return readErr
-			}
-			var previous threadFingerprint
-			unchanged = readErr == nil && json.Unmarshal([]byte(value), &previous) == nil &&
-				previous.ReplyCount == fingerprint.ReplyCount && previous.LatestReply == fingerprint.LatestReply &&
-				fingerprint.LatestReply != "" && !now.Before(previous.CheckedAt) && now.Sub(previous.CheckedAt) < 24*time.Hour
-		}
-		if unchanged {
-			_, err := st.GetSyncState(ctx, SourceUser, "thread_skip", threadKey)
-			if err != nil && !errors.Is(err, sql.ErrNoRows) {
-				return err
-			}
-			unchanged = errors.Is(err, sql.ErrNoRows)
-		}
-		if unchanged {
 			var err error
-			unchanged, err = st.ThreadRepliesMatch(ctx, workspaceID, channel.ID, threadTS, fingerprint.ReplyCount, fingerprint.LatestReply)
+			unchanged, err = reusableThreadFingerprint(ctx, st, workspaceID, channel.ID, threadTS, fingerprint, now)
 			if err != nil {
 				return err
 			}
 		}
+
 		// Invalidate before fetching, including unoptimized runs: a failed newer
 		// attempt must never leave an earlier successful fingerprint reusable.
 		if !unchanged {
@@ -190,6 +202,13 @@ func (c *Client) syncChannelMessagesWithSource(ctx context.Context, st *store.St
 				}
 			}
 		}
+		if !source.changedThreads && observed && fetchedRoot.RootObserved && fetchedRoot.FetchedReplies == fingerprint.ReplyCount && fetchedRoot.FetchedLatest == fingerprint.LatestReply && fetchedRoot.ReplyCount == fingerprint.ReplyCount && fetchedRoot.LatestReply == fingerprint.LatestReply {
+			matches, err = st.ThreadRepliesMatch(ctx, workspaceID, channel.ID, threadTS, fingerprint.ReplyCount, fingerprint.LatestReply)
+			if err != nil {
+				return err
+			}
+		}
+
 		if matches {
 			fingerprint.CheckedAt = now
 			value, err := json.Marshal(fingerprint)
@@ -233,8 +252,8 @@ func (c *Client) syncChannelMessagesWithSource(ctx context.Context, st *store.St
 		resp, err := c.getConversationHistory(ctx, source.token, &slack.GetConversationHistoryParameters{
 			ChannelID: channel.ID,
 			Cursor:    cursor,
-			Limit:     200,
-			Oldest:    oldest,
+			Limit:     historyPageSize,
+			Oldest:    requestOldest,
 			Latest:    horizon,
 			Inclusive: inclusive,
 		}, checkAttempt)
@@ -272,6 +291,12 @@ func (c *Client) syncChannelMessagesWithSource(ctx context.Context, st *store.St
 		if err := validateMessagePage(resp.Messages, channel.ID); err != nil {
 			return fmt.Errorf("channel %s history: %w", channel.ID, err)
 		}
+		if source.incrementalThreads && oldest != "" {
+			resp.Messages, err = incrementalHistoryWrites(ctx, st, workspaceID, channel.ID, resp.Messages, oldest, now, knownOldRoots, preexistingWork)
+			if err != nil {
+				return err
+			}
+		}
 		batch := store.WriteBatch{HistoryGuard: &attempt, Messages: make([]store.MessageWrite, 0, len(resp.Messages)), ThreadDiscovery: discovery}
 		threadTSs := make([]string, 0)
 		queuedThreads := map[string]struct{}{}
@@ -286,7 +311,7 @@ func (c *Client) syncChannelMessagesWithSource(ctx context.Context, st *store.St
 				EnforceRetention:       enforceRetention,
 				SkipWorkspaceCollision: true,
 			})
-			if msg.ThreadTimestamp == "" || msg.ThreadTimestamp == msg.Timestamp {
+			if (msg.ThreadTimestamp == "" || msg.ThreadTimestamp == msg.Timestamp) && (!source.incrementalThreads || rawMsg.ReplyCountPresent) {
 				observedThreads[msg.Timestamp] = threadFingerprint{ReplyCount: msg.ReplyCount, LatestReply: msg.LatestReply}
 			}
 			if source.retainedThreads && msg.ReplyCount > 0 {
@@ -344,21 +369,23 @@ func (c *Client) syncChannelMessagesWithSource(ctx context.Context, st *store.St
 		return errors.New("Slack reported a history/message limit; completeness of the requested interval is uncertified; review workspace history availability")
 	}
 	if source.retainedThreads {
-		roots, err := st.ChannelThreadRoots(ctx, workspaceID, channel.ID)
-		if err != nil {
-			return err
-		}
-		batch := store.WriteBatch{HistoryGuard: &attempt, ThreadDiscovery: discovery}
-		for _, root := range roots {
-			batch.PendingThreads = append(batch.PendingThreads, store.ThreadWork{SourceName: SourceUser, WorkspaceID: workspaceID, ChannelID: channel.ID, TS: root.TS})
-		}
-		if len(batch.PendingThreads) > 0 {
-			result, err := st.ApplyWriteBatch(ctx, batch)
+		if !source.incrementalThreads {
+			roots, err := st.ChannelThreadRoots(ctx, workspaceID, channel.ID)
 			if err != nil {
 				return err
 			}
-			for _, work := range result.PendingThreads {
-				pendingThreads[work.TS] = work
+			batch := store.WriteBatch{HistoryGuard: &attempt, ThreadDiscovery: discovery}
+			for _, root := range roots {
+				batch.PendingThreads = append(batch.PendingThreads, store.ThreadWork{SourceName: SourceUser, WorkspaceID: workspaceID, ChannelID: channel.ID, TS: root.TS})
+			}
+			if len(batch.PendingThreads) > 0 {
+				result, err := st.ApplyWriteBatch(ctx, batch)
+				if err != nil {
+					return err
+				}
+				for _, work := range result.PendingThreads {
+					pendingThreads[work.TS] = work
+				}
 			}
 		}
 		if userRepliesAvailable {
@@ -519,15 +546,16 @@ type threadFingerprint struct {
 }
 
 type channelSyncSource struct {
-	changedThreads   bool
-	token            string
-	sourceName       string
-	sourceRank       int
-	allowJoin        bool
-	skipMissingScope bool
-	threadSkip       *threadSkipTracker
-	coverageScope    string
-	retainedThreads  bool
+	changedThreads     bool
+	incrementalThreads bool
+	token              string
+	sourceName         string
+	sourceRank         int
+	allowJoin          bool
+	skipMissingScope   bool
+	threadSkip         *threadSkipTracker
+	coverageScope      string
+	retainedThreads    bool
 }
 
 func (c *Client) syncChannels(ctx context.Context, st *store.Store, workspaceID string, channels []slack.Channel, opts SyncOptions, now time.Time, userRepliesAvailable bool, threadSkip *threadSkipTracker) error {
@@ -652,7 +680,8 @@ func (c *Client) syncChannelsWithSource(ctx context.Context, st *store.Store, wo
 	if err != nil || len(channels) == 0 {
 		return err
 	}
-	source.changedThreads = opts.ChangedThreads
+	source.changedThreads = opts.ChangedThreads || opts.IncrementalThreads
+	source.incrementalThreads = opts.IncrementalThreads
 	source.coverageScope = opts.Since
 	source.retainedThreads = opts.ordinarySync && opts.Since == ""
 	channels, historyOptions, err := c.channelSyncPlan(ctx, st, workspaceID, channels, opts)

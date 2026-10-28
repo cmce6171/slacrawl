@@ -496,8 +496,7 @@ once per decision. Every key must be canonical, even for a different workspace;
 after key validation, workspace-only decisions ignore foreign values. Archive-wide
 Sync and CLI Doctor evaluate every API value, while repair and Full skip cleanup
 evaluate the selected workspace. Malformed selected values fail without clearing
-state. A valid record is incomplete when Complete is false or Pending is present,
-including an empty Pending; missing records are not invented. Finding pending
+state. A valid current record is incomplete when Complete is false or Pending is present, including an empty Pending. An older bounded or bot record can be superseded for evaluation by a later completed unbounded user scan of the same workspace/channel whose horizon covers the older requested horizon. Records remain stored and validated. Current unbounded user failures and newer failures cannot be superseded. Missing records are not invented. Finding pending
 work does not bypass validation of later records.
 
 A replies collision without an owned thread generation queues or renews only the
@@ -1007,3 +1006,15 @@ internal/store/storedb/   # generated sqlc wrappers
 internal/search/
 internal/syncer/
 ```
+
+## Incremental thread polling extension
+
+User-primary `--incremental-threads` uses ordinary completed-history bounds for
+message ingestion and exhaustively scans older parent metadata separately. It
+creates durable jobs and writes old roots only when cached current reply proof
+cannot be reused. Zero-reply old parents remain in the metadata scan so their
+first replies are discoverable. Existing jobs retry even if hints disappear.
+All metadata pages require the same identity, native success, pagination and
+history-limit validation as ordinary history. Failure prevents completed history.
+The ordinary history attempt generation guards both passes and their writes.
+Full reconciliation remains a separate explicit full message/reply traversal.

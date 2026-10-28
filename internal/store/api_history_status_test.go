@@ -41,6 +41,63 @@ func TestAPIHistoryStatusScopes(t *testing.T) {
 	}
 }
 
+func TestAPIHistoryStatusSupersedesOlderCoveredScopes(t *testing.T) {
+	ctx := context.Background()
+	st := openBatchTestStore(t)
+
+	// Since is the third history-key element. It is a date bound, not a
+	// thread timestamp, so this bounded record belongs to the same channel as
+	// the unbounded scan below.
+	seedAPIHistoryState(t, st, APIHistoryScope{
+		SourceName: "api-user", WorkspaceID: "T1", ChannelID: "C1", Since: "1710000000.000000",
+	}, APIHistoryState{
+		Complete: true, Latest: "1710000100.000000", Pending: new("1710000000.000000"),
+		Generation: "bounded-generation", PendingLatest: "1710000200.000000",
+	})
+	seedAPIHistoryState(t, st, APIHistoryScope{SourceName: "api-bot", WorkspaceID: "T1", ChannelID: "C1"}, APIHistoryState{
+		Pending: new(""), Generation: "bot-generation", PendingLatest: "1710000250.000000",
+	})
+	seedAPIHistoryState(t, st, APIHistoryScope{SourceName: "api-user", WorkspaceID: "T1", ChannelID: "C1"}, APIHistoryState{
+		Complete: true, Latest: "1710000300.000000",
+	})
+	_, err := st.DB().ExecContext(ctx, `update sync_state set updated_at='2026-10-28T18:00:00Z'
+	where source_name='api-user' and entity_type=? and entity_id='["T1","C1","1710000000.000000"]'`, APIHistoryEntityType)
+	require.NoError(t, err)
+	_, err = st.DB().ExecContext(ctx, `update sync_state set updated_at='2026-10-28T18:30:00Z'
+where source_name='api-bot' and entity_type=? and entity_id='["T1","C1",""]'`, APIHistoryEntityType)
+	require.NoError(t, err)
+	_, err = st.DB().ExecContext(ctx, `update sync_state set updated_at='2026-10-28T19:00:00Z'
+where source_name='api-user' and entity_type=? and entity_id='["T1","C1",""]'`, APIHistoryEntityType)
+	require.NoError(t, err)
+
+	before := apiHistoryArchiveRows(t, st)
+	incomplete, err := st.HasIncompleteAPIHistory(ctx, "")
+	require.NoError(t, err)
+	require.False(t, incomplete, "newer completed unbounded user history covers older bounded and bot attempts")
+	require.Equal(t, before, apiHistoryArchiveRows(t, st), "coverage evaluation preserves historical rows")
+}
+
+func TestAPIHistoryStatusKeepsNewerFailureVisible(t *testing.T) {
+	ctx := context.Background()
+	st := openBatchTestStore(t)
+	seedAPIHistoryState(t, st, APIHistoryScope{SourceName: "api-user", WorkspaceID: "T1", ChannelID: "C1"}, APIHistoryState{
+		Complete: true, Latest: "1710000300.000000",
+	})
+	seedAPIHistoryState(t, st, APIHistoryScope{SourceName: "api-bot", WorkspaceID: "T1", ChannelID: "C1"}, APIHistoryState{
+		Pending: new(""), Generation: "newer-bot-generation", PendingLatest: "1710000250.000000",
+	})
+	_, err := st.DB().ExecContext(ctx, `update sync_state set updated_at='2026-10-28T19:00:00Z'
+where source_name='api-user' and entity_type=? and entity_id='["T1","C1",""]'`, APIHistoryEntityType)
+	require.NoError(t, err)
+	_, err = st.DB().ExecContext(ctx, `update sync_state set updated_at='2026-10-28T20:00:00Z'
+where source_name='api-bot' and entity_type=? and entity_id='["T1","C1",""]'`, APIHistoryEntityType)
+	require.NoError(t, err)
+
+	incomplete, err := st.HasIncompleteAPIHistory(ctx, "")
+	require.NoError(t, err)
+	require.True(t, incomplete, "a newer incomplete attempt must not be hidden by an older completed scan")
+}
+
 func TestAPIHistoryStatusValidatesAllOwnedKeys(t *testing.T) {
 	for _, key := range []string{
 		"private-key-canary", "null", `["T1","C1"]`, `["T1","C1","","extra"]`,

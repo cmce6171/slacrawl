@@ -283,17 +283,17 @@ func (s *Store) HasIncompleteAPIHistory(ctx context.Context, workspaceID string)
 }
 
 func hasIncompleteAPIHistory(ctx context.Context, q storedb.DBTX, workspaceID string) (bool, error) {
-	rows, err := q.QueryContext(ctx, `select source_name, entity_id, value from sync_state
+	rows, err := q.QueryContext(ctx, `select source_name, entity_id, value, updated_at from sync_state
 where source_name in ('api-bot', 'api-user') and entity_type = ?
 order by source_name, entity_id`, APIHistoryEntityType)
 	if err != nil {
 		return false, err
 	}
 	defer rows.Close()
-	incomplete := false
+	var records []apiHistoryCoverageRecord
 	for rows.Next() {
-		var source, key, raw string
-		if err := rows.Scan(&source, &key, &raw); err != nil {
+		var source, key, raw, updatedAt string
+		if err := rows.Scan(&source, &key, &raw, &updatedAt); err != nil {
 			return false, err
 		}
 		scope, err := decodeAPIHistoryKey(source, key)
@@ -309,14 +309,83 @@ order by source_name, entity_id`, APIHistoryEntityType)
 		if err != nil {
 			return false, err
 		}
-		incomplete = incomplete || !state.Complete || state.Pending != nil
+		records = append(records, apiHistoryCoverageRecord{
+			source: source, scope: scope, state: state, updatedAt: updatedAt,
+		})
 	}
 	// Do not return early on pending work: later malformed records still veto
 	// the decision, and must never be hidden by SQL JSON filters or joins.
 	if err := rows.Err(); err != nil {
 		return false, err
 	}
-	return incomplete, nil
+	for _, record := range records {
+		if record.state.Complete && record.state.Pending == nil {
+			continue
+		}
+		if apiHistoryCoveredByNewerUserScan(record, records) {
+			continue
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+type apiHistoryCoverageRecord struct {
+	source    string
+	scope     APIHistoryScope
+	state     APIHistoryState
+	updatedAt string
+}
+
+// apiHistoryCoveredByNewerUserScan only retires evaluation of an incomplete
+// historical row. The row remains in sync_state and is still decoded above.
+// A completed, unbounded api-user scan is authoritative for the same
+// workspace/channel when it was written later and covered the older attempt's
+// recorded upper horizon. An incomplete unbounded api-user row is the current
+// canonical scope and can never be hidden by this rule.
+func apiHistoryCoveredByNewerUserScan(record apiHistoryCoverageRecord, records []apiHistoryCoverageRecord) bool {
+	if record.source == "api-user" && record.scope.Since == "" {
+		return false
+	}
+	horizon, ok := apiHistoryIncompleteHorizon(record)
+	if !ok {
+		return false
+	}
+	for _, candidate := range records {
+		if candidate.source != "api-user" || candidate.scope.Since != "" ||
+			candidate.scope.WorkspaceID != record.scope.WorkspaceID || candidate.scope.ChannelID != record.scope.ChannelID ||
+			!candidate.state.Complete || candidate.state.Pending != nil {
+			continue
+		}
+		latest, _ := apiHistoryTimestamp(candidate.state.Latest)
+		if latest < horizon {
+			continue
+		}
+		candidateAt, staleAt := parseDBTime(candidate.updatedAt), parseDBTime(record.updatedAt)
+		if candidateAt.IsZero() || staleAt.IsZero() || !candidateAt.After(staleAt) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func apiHistoryIncompleteHorizon(record apiHistoryCoverageRecord) (float64, bool) {
+	var horizon float64
+	found := false
+	for _, value := range []string{record.state.Latest, record.state.PendingLatest} {
+		if value == "" {
+			continue
+		}
+		parsed, err := apiHistoryTimestamp(value)
+		if err != nil {
+			return 0, false
+		}
+		if !found || parsed > horizon {
+			horizon, found = parsed, true
+		}
+	}
+	return horizon, found
 }
 
 func decodeAPIHistoryKey(source, key string) (APIHistoryScope, error) {

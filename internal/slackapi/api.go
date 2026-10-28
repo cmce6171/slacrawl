@@ -47,18 +47,19 @@ type Diagnostics struct {
 }
 
 type SyncOptions struct {
-	WorkspaceID       string
-	Channels          []string
-	ExcludeChannels   []string
-	Since             string
-	Full              bool
-	SelectedDiscovery bool
-	ChangedThreads    bool
-	LatestOnly        bool
-	Concurrency       int
-	AutoJoin          *bool
-	enforceRetention  bool
-	ordinarySync      bool
+	WorkspaceID        string
+	Channels           []string
+	ExcludeChannels    []string
+	Since              string
+	Full               bool
+	SelectedDiscovery  bool
+	ChangedThreads     bool
+	IncrementalThreads bool
+	LatestOnly         bool
+	Concurrency        int
+	AutoJoin           *bool
+	enforceRetention   bool
+	ordinarySync       bool
 }
 
 type Client struct {
@@ -175,6 +176,9 @@ func (c *Client) Doctor(ctx context.Context) (Diagnostics, error) {
 }
 
 func (c *Client) Sync(ctx context.Context, st *store.Store, opts SyncOptions) error {
+	if opts.IncrementalThreads && (opts.Full || opts.Since != "" || opts.LatestOnly || opts.ChangedThreads || c.tokens.User == "" || c.tokens.Bot != "") {
+		return errors.New("incremental-threads requires user-primary API sync without full, since, latest-only or changed-threads")
+	}
 	if opts.SelectedDiscovery && len(opts.Channels) == 0 {
 		return errors.New("selected discovery requires explicit channel IDs")
 	}

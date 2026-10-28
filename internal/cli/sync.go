@@ -34,6 +34,7 @@ func (a *App) runSync(ctx context.Context, configPath string, args []string, for
 	full := fs.Bool("full", false, "full sync")
 	selectedDiscovery := fs.Bool("selected-discovery", false, "resolve only explicitly selected conversation metadata")
 	changedThreads := fs.Bool("changed-threads", false, "with full API history, fetch only changed threads; reconcile all replies every 24 hours")
+	incrementalThreads := fs.Bool("incremental-threads", false, "incremental messages with exhaustive old-parent metadata checks and changed-thread fetches")
 	latestOnly := fs.Bool("latest-only", false, "skip first-time historical backfills")
 	limit := fs.Int("limit", 0, "maximum provider messages (validation imports only)")
 	concurrency := fs.Int("concurrency", cfg.Sync.Concurrency, "worker count")
@@ -59,6 +60,9 @@ func (a *App) runSync(ctx context.Context, configPath string, args []string, for
 	if err != nil {
 		return err
 	}
+	if *incrementalThreads && (resolvedSource != syncer.SourceAPI || *full || *since != "" || *latestOnly || *changedThreads) {
+		return errors.New("incremental-threads requires source api without full, since, latest-only or changed-threads")
+	}
 	if *changedThreads && (resolvedSource != syncer.SourceAPI || !*full || *since != "" || *latestOnly) {
 		return errors.New("changed-threads requires source api and full, without since or latest-only")
 	}
@@ -71,17 +75,18 @@ func (a *App) runSync(ctx context.Context, configPath string, args []string, for
 			cfg.Sync.ExcludeChannels,
 			csv(*excludeChannels),
 		),
-		Since:             normalizedSince,
-		Full:              *full,
-		ChangedThreads:    *changedThreads,
-		SelectedDiscovery: *selectedDiscovery,
-		LatestOnly:        *latestOnly,
-		Limit:             *limit,
-		Concurrency:       *concurrency,
-		AutoJoin:          boolPtr(*autoJoin),
-		APIURL:            a.apiURL,
-		HTTPClient:        a.httpClient,
-		Logger:            progressLogger(a.Stderr),
+		Since:              normalizedSince,
+		Full:               *full,
+		ChangedThreads:     *changedThreads,
+		IncrementalThreads: *incrementalThreads,
+		SelectedDiscovery:  *selectedDiscovery,
+		LatestOnly:         *latestOnly,
+		Limit:              *limit,
+		Concurrency:        *concurrency,
+		AutoJoin:           boolPtr(*autoJoin),
+		APIURL:             a.apiURL,
+		HTTPClient:         a.httpClient,
+		Logger:             progressLogger(a.Stderr),
 	}
 	st, err := a.openStore(cfg)
 	if err != nil {

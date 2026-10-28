@@ -125,8 +125,9 @@ func (c *Client) getConversations(ctx context.Context, token string, params *sla
 }
 
 type rawConversationMessage struct {
-	Message    slack.Message
-	RawPayload any
+	Message           slack.Message
+	RawPayload        any
+	ReplyCountPresent bool
 }
 
 type conversationHistoryPage struct {
@@ -295,6 +296,7 @@ func (c *Client) postSlackForm(ctx context.Context, token string, method string,
 		if err != nil {
 			return nil, &nativeDiagnosticError{method: method, phase: "rate-limit header", cause: err}
 		}
+		c.warnLogger().Info("Slack API rate-limit wait", "method", method, "retry_after_seconds", seconds)
 		return nil, &slack.RateLimitedError{RetryAfter: time.Duration(seconds) * time.Second}
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -374,9 +376,16 @@ func rawConversationMessages(rawMessages []json.RawMessage) ([]rawConversationMe
 		if err := json.Unmarshal(raw, &msg); err != nil {
 			return nil, err
 		}
+		var metadata struct {
+			ReplyCount *int `json:"reply_count"`
+		}
+		if err := json.Unmarshal(raw, &metadata); err != nil {
+			return nil, err
+		}
 		messages = append(messages, rawConversationMessage{
-			Message:    msg,
-			RawPayload: rawPayloadFromMessageJSON(raw),
+			ReplyCountPresent: metadata.ReplyCount != nil,
+			Message:           msg,
+			RawPayload:        rawPayloadFromMessageJSON(raw),
 		})
 	}
 	return messages, nil

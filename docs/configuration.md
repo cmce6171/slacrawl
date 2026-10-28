@@ -127,9 +127,7 @@ channel. Coverage decisions separately scan retained records for the exact API
 sources and history type. Every key must be canonical; workspace-only decisions
 ignore a foreign value only after validating its key. Sync and CLI Doctor use an
 archive-wide view, while repair and Full skip cleanup use the selected workspace.
-Malformed relevant records fail without resetting or deleting them. Pending work,
-including an empty pending bound, or a record without completed history keeps
-coverage partial. Missing records do not invent completion.
+Malformed relevant records fail without resetting or deleting them. Current pending work, including an empty pending bound, or a record without completed history keeps coverage partial. An older bounded or bot checkpoint is historical when a later completed unbounded user scan of the same workspace/channel covers its requested horizon. All records still validate; newer failures, current unbounded failures, jobs and skips remain visible. Historical records are preserved. Missing records do not invent completion.
 
 These checks do not fence older unconditional writers or skip diagnostics shared
 by different history scopes. Status reads counts, freshness and the coverage
@@ -1334,3 +1332,27 @@ path = ""
 repair_every = "30m"
 desktop_refresh_every = "5m"
 ```
+
+### Incremental polling with old-thread detection
+
+`sync --source api --incremental-threads --auto-join=false` requires a user-primary
+API source and rejects Full, Since, LatestOnly and ChangedThreads. New channels
+bootstrap normally. Seeded channels use the completed history horizon with the
+normal one-hour overlap for message ingestion. Older parent history is still
+paginated exhaustively, without rewriting unchanged historical messages or
+creating work for cached unchanged threads. This includes old zero-reply parents:
+a first reply supplies new metadata and triggers a full authoritative thread read.
+Incomplete/limited pages or failed replies retain pending coverage and retry work.
+Search permissions and search-index completeness are not required.
+
+This is incremental ingestion, not a delta-only Slack API: history permissions do
+not supply an old-thread change feed. Every poll must still inspect old parent
+metadata. Cached reply proof remains conservative and expires after 24 hours.
+Existing pending work and skips force retry. This does not discover hidden delete
+events or immediately detect edits to unchanged old message bodies.
+
+Run a separate `sync --source api --full --auto-join=false` for full reconciliation
+of old message bodies and all replies. Successful matching full thread reads also
+refresh the cache used by subsequent incremental polls. Never run separate writers
+for the same archive simultaneously; the local scheduler serializes them and
+records reconciliation separately from normal polls.
